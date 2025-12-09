@@ -1,47 +1,44 @@
 ## ============================================================
 ## Example ROC simulation for DANCE-improved
-##  - Binary A, continuous Y
-##  - Multiple Z-types (valid disconnected NCs + various invalid NCs)
-##  - Only "disconnected" Z's are treated as true valid NCs
-##
-## How to run (from repo root, where these files exist):
-##   - tetrad_helpers.cpp
-##   - FindNegativeControls.R
-##
-## Then in R:
-##   source("example_roc_plasmode.R")
 ## ============================================================
 
-## ------------------ Load core implementation ------------------
+## ----------------- Load core implementation -----------------
 
 if (!requireNamespace("Rcpp", quietly = TRUE)) {
   stop("Package 'Rcpp' is required. Please install it first.")
 }
-Rcpp::sourceCpp("tetrad_helpers.cpp")
+if (!requireNamespace("MESS", quietly = TRUE)) {
+  stop("Package 'MESS' is required for AUC. Please install it.")
+}
+if (!requireNamespace("RColorBrewer", quietly = TRUE)) {
+  stop("Package 'RColorBrewer' is required for plotting. Please install it.")
+}
 
-source("FindNegativeControls.R")
+Rcpp::sourceCpp("tetrad_helpers.cpp")   # C++ helpers
+source("find_negative_controls.R")        # your main NC search
 
-## FindNegativeControls uses a global 'conditional' flag
-conditional <- TRUE  # use conditional correlation on baseline X by default
+## Use conditional correlation on baseline X by default
+conditional <- TRUE
 
-## ----------------------- Data generating process ----------------
-## Binary A, continuous Y, continuous Z's and X's.
-## Z-types:
-##   - disconnected      (valid NC given X)
-##   - independent       (X -> Z)
-##   - instrumental_A    (U, X, A -> Z)
-##   - instrumental_Y    (U, X -> Z, Z -> Y)
-##   - confounder        (U, X, A -> Z, Z -> Y)
-##   - chain             (pairs Z_chain_ia, Z_chain_ib: U,X -> Z1; Z1,U,X -> Z2)
+## ---------------- Data generating process (continuous A) ----------------
+## A, Y, Z, X all continuous.
+## Z-types created:
+##   - disconnected      : U, X -> Z   (valid NCs given X)
+##   - independent       : X -> Z
+##   - instrumental_A    : U, X, A -> Z
+##   - instrumental_Y    : U, X -> Z,  Z -> Y
+##   - confounder        : U, X, A -> Z, Z -> Y
+##   - chain             : pair (Z_chain_ia, Z_chain_ib):
+##                         U, X -> Z1; (Z1, U, X) -> Z2
 
 generate_example_data <- function(
-    n             = 2000,
+    n             = 1000,
     p_x           = 5,
     n_disc        = 20,
     n_indep       = 20,
-    n_instr_A     = 15,
-    n_instr_Y     = 15,
-    n_confounder  = 15,
+    n_instr_A     = 20,
+    n_instr_Y     = 20,
+    n_confounder  = 20,
     n_chain_pairs = 10,
     seed          = NULL
 ) {
@@ -54,14 +51,12 @@ generate_example_data <- function(
   ## Latent confounder
   U <- rnorm(n)
   
-  ## Treatment A | X, U  (binary)
+  ## Continuous treatment A | X, U
   alpha_x <- runif(p_x, -0.5, 0.5)
   alpha_u <- 1.0
-  linA <- 0.2 + as.numeric(X %*% alpha_x) + alpha_u * U
-  pA   <- 1 / (1 + exp(-linA))
-  A    <- rbinom(n, size = 1, prob = pA)
+  A <- 0.5 + as.numeric(X %*% alpha_x) + alpha_u * U + rnorm(n)
   
-  ## Outcome Y | A, X, U (base, before Z effects)
+  ## Outcome Y | A, X, U (before Z effects)
   beta_a <- 1.0
   beta_x <- runif(p_x, -0.5, 0.5)
   beta_u <- 1.0
@@ -75,7 +70,7 @@ generate_example_data <- function(
     z_type[name]   <<- lbl
   }
   
-  ## 1) Valid NCs: disconnected (U, X -> Z), no direct effect on A or Y
+  ## 1) Valid NCs: disconnected (U, X -> Z)
   if (n_disc > 0) {
     for (j in seq_len(n_disc)) {
       gx <- runif(p_x, -0.5, 0.5)
@@ -85,7 +80,7 @@ generate_example_data <- function(
     }
   }
   
-  ## 2) Independent-type: X -> Z only (no U, no A)
+  ## 2) Independent-type: X -> Z (no U, no A)
   if (n_indep > 0) {
     for (j in seq_len(n_indep)) {
       gx <- runif(p_x, -0.5, 0.5)
@@ -111,7 +106,6 @@ generate_example_data <- function(
       gx <- runif(p_x, -0.5, 0.5)
       gu <- runif(1, 0.5, 1.5) * sample(c(-1, 1), 1)
       Zj <- as.numeric(X %*% gx + gu * U + rnorm(n))
-      # direct effect on Y
       gy <- runif(1, 0.5, 1.5) * sample(c(-1, 1), 1)
       Y  <- Y + gy * Zj
       add_var(sprintf("Z_instrY_%d", j), Zj, "instrumental_Y")
@@ -147,8 +141,7 @@ generate_example_data <- function(
     }
   }
   
-  ## Assemble observed data:
-  ##  - U is *latent* (not included)
+  ## Assemble observed data: U is latent (not included)
   df <- data.frame(
     A = A,
     Y = as.numeric(Y),
@@ -171,7 +164,7 @@ generate_example_data <- function(
   )
 }
 
-## ------------------ Helper utilities ---------------------------
+## ---------------- Helper utilities for ROC -------------------
 
 # Map Z names to integer indices
 z_indexer <- function(z_names) {
@@ -239,25 +232,24 @@ discover_nc <- function(df, tname, oname, multiple,
   })
 }
 
-## ---------------------- ROC simulation -------------------------
+## -------------------- ROC for one sample size -----------------
 
-sim_roc <- function(samplesize   = 2000,
-                    ntry         = 50,
-                    tname        = "A",
-                    oname        = "Y",
+sim_roc <- function(size = 1000, ntry = 200,
+                    tname = "A", oname = "Y",
                     independence = TRUE,
-                    alpha_corr   = 0.2,
-                    use_pair     = TRUE) {
+                    alpha_corr = 0.2,
+                    use_pair = TRUE) {
   
-  multiple <- 2^seq(-4, 3, by = 1)   # vtalpha grid: m / n
-  L <- length(multiple)
+  # NEW: vtalpha grid from very strict to extremely loose
+  vt_grid <- seq(0.001, 1, length.out = 12)
+  L <- length(vt_grid)
   
   tp <- fp <- fn <- tn <- na <- numeric(L)
   trials_used <- 0L
   
   for (j in seq_len(ntry)) {
     set.seed(j)
-    out <- generate_example_data(n = samplesize, seed = j)
+    out <- generate_example_data(n = size, seed = j)
     df      <- out$data
     Z_types <- out$Z_types
     X_names <- out$X_names
@@ -266,30 +258,40 @@ sim_roc <- function(samplesize   = 2000,
     N       <- length(z_names)
     if (N < 3L) next
     
-    z_idx <- z_indexer(z_names)
+    z_idx    <- z_indexer(z_names)
     disc_nm  <- Z_types$variable[Z_types$type == "disconnected"]
     disc_idx <- unname(z_idx[disc_nm])
     answer   <- make_key_valid_idx(disc_idx, N)
     dim_ans  <- length(answer)
     if (dim_ans == 0L) next
     
-    tot <- choose(N, 3L)  # total possible triplets
+    tot <- choose(N, 3L)
     
     varError <- FALSE
     res_list <- tryCatch(
-      discover_nc(df, tname, oname, multiple,
-                  baseline     = X_names,
-                  independence = independence,
-                  alpha_corr   = alpha_corr,
-                  use_pair     = use_pair),
+      lapply(vt_grid, function(vtalpha) {
+        FindNegativeControls(
+          data         = df,
+          tname        = tname,
+          oname        = oname,
+          baseline     = X_names,
+          vtalpha      = vtalpha,   # use vtalpha directly
+          independence = independence,
+          exclude_rare = FALSE,
+          alpha_corr   = alpha_corr,
+          use_pair     = use_pair,
+          FindBest     = FALSE
+        )
+      }),
       warning = function(w) { varError <<- TRUE; NULL },
       error   = function(e) { varError <<- TRUE; NULL }
     )
     if (varError || is.null(res_list)) next
     trials_used <- trials_used + 1L
     
-    for (i in seq_along(multiple)) {
+    for (i in seq_along(vt_grid)) {
       res_mat <- res_list[[i]]
+      
       if (is.null(res_mat) ||
           !length(res_mat) ||
           (is.matrix(res_mat) && ncol(res_mat) == 0L)) {
@@ -298,6 +300,7 @@ sim_roc <- function(samplesize   = 2000,
         na[i] <- na[i] + 1
         next
       }
+      
       chk <- test_check_int(res_mat, answer,
                             z_names = z_names, z_idx = z_idx)
       tp[i] <- tp[i] + chk$tp
@@ -310,46 +313,60 @@ sim_roc <- function(samplesize   = 2000,
   tpr <- tp / pmax(tp + fn, 1)
   fpr <- fp / pmax(fp + tn, 1)
   
-  list(
-    tpr         = tpr,
-    fpr         = fpr,
-    multiple    = multiple,
-    trials_used = trials_used
+  list(tpr = tpr,
+       fpr = fpr,
+       vt_grid = vt_grid,
+       trials_used = trials_used)
+}
+
+## ----------------- Multiple sample sizes + one ROC plot -------
+
+s   <- c(100, 500, 1000, 2000, 10000)
+auc <- numeric(length(s))
+roc <- vector("list", length(s))
+
+for (i in seq_along(s)) {
+  cat("Running sim_roc for n =", s[i], "...\n")
+  roc[[i]] <- sim_roc(size = s[i], ntry = 20)
+  
+  # AUC prefers FPR in ascending order
+  ord <- order(roc[[i]]$fpr)
+  auc[i] <- round(
+    MESS::auc(roc[[i]]$fpr[ord], roc[[i]]$tpr[ord],
+              rule = 2, from = 0, to = 1),
+    3
   )
 }
 
-## ---------------------- Run example & plot ---------------------
-
-if (!requireNamespace("MESS", quietly = TRUE)) {
-  stop("Package 'MESS' is required for AUC. Please install it.")
-}
-if (!requireNamespace("RColorBrewer", quietly = TRUE)) {
-  stop("Package 'RColorBrewer' is required for plotting. Please install it.")
-}
-
-set.seed(123)
-roc_res <- sim_roc(samplesize = 2000, ntry = 50)
-
-ord     <- order(roc_res$fpr)
-auc_val <- MESS::auc(roc_res$fpr[ord], roc_res$tpr[ord],
-                     from = 0, to = 1, rule = 2)
-
-cat("Estimated AUC:", round(auc_val, 3),
-    "  (trials used =", roc_res$trials_used, ")\n")
-
 library(RColorBrewer)
-cols <- brewer.pal(3, "Set1")
+col <- brewer.pal(6, "Set1")
 
+par(mar = c(3, 3, 1, 1))
 plot(0, 0, xlim = c(0, 1), ylim = c(0, 1),
-     type = "n",
-     xlab = "False positive rate",
-     ylab = "True positive rate")
-lines(c(0, 1), c(0, 1), lty = 2, col = "grey")
+     xlab = "", ylab = "",
+     type = "n", font.lab = 1,
+     cex.lab = 0.7, cex.axis = 0.7)
+title(ylab = "True positive rate", cex.lab = 0.7, mgp = c(2, 2, 0))
+title(xlab = "False positive rate", cex.lab = 0.7, mgp = c(2, 2, 0))
+lines(c(0, 1), c(0, 1), lwd = 2)
 
-lines(c(0, roc_res$fpr[ord], 1),
-      c(0, roc_res$tpr[ord], 1),
-      col = cols[1], lwd = 2)
+for (i in seq_along(s)) {
+  ord <- order(roc[[i]]$fpr)
+  lines(c(0, roc[[i]]$fpr[ord], 1),
+        c(0, roc[[i]]$tpr[ord], 1),
+        lty = i, col = col[i], lwd = 2)
+  
+  # highlight mid-grid thresholds if they exist
+  if (length(roc[[i]]$fpr) >= 7) {
+    points(roc[[i]]$fpr[6], roc[[i]]$tpr[6],
+           col = col[i], lwd = 1, pch = 19)
+    points(roc[[i]]$fpr[7], roc[[i]]$tpr[7],
+           col = col[i], lwd = 1, pch = 1)
+  }
+}
 
-legend("bottomright",
-       legend = paste("DANCE-improved (AUC =", round(auc_val, 3), ")"),
-       col = cols[1], lwd = 2, bty = "n")
+legend("bottomright", inset = 0.05,
+       legend = paste("n =", s, ", AUC:", sprintf("%.3f", auc)),
+       lty = 1:length(s), lwd = 3, col = col,
+       bty = "n", cex = 0.6, pt.cex = 0.5)
+
